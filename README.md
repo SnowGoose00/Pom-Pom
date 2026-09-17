@@ -16,7 +16,7 @@
 |---|---|
 | 知识库 | 260,577 条记录 → **102,243 个向量片段**（SQLite + sqlite-vec，231 MB） |
 | 对话覆盖率 | 游戏内 `TalkSentenceConfig` 共 240,488 条对话，本地能引用到 **125,518 条（52.2%）** |
-| 自动化测试 | **165 passed**（`pytest`，结果自动存档到 `test-results/`） |
+| 自动化测试 | **168 passed**（`pytest`，结果自动存档到 `test-results/`） |
 | 统一评测集 | `eval/testset.json` 65 题 / 10 个轴：快档 **28/30**、普通档 **28/29**、深度档 **6/6**（另有 3 条已知缺口记录在案） |
 | 检索 | 向量检索 ＋ 实体字面检索 ＋ 角色路由 ＋ 多样性重排（MMR / 单场景配额） |
 | 联网 | 多源链：博查（带 key 优先）→ DuckDuckGo → 360 → 搜狗，带节流／失败冷却／缓存 |
@@ -337,6 +337,14 @@ app/
 static/           index.html / style.css / app.js（前端）
 scripts/          取数、起服务、跑测试与各类探针
 docs/             交接文档、人设文档、设计与计划
-tests/            pytest（157 条）
+tests/            pytest（168 条）
 data/             原始数据、提取结果与向量库（均不入库）
 ```
+
+## 许可
+
+代码以 [MIT](LICENSE) 许可发布，© 2026 SnowGoose00。
+
+几点说明：《崩坏：星穹铁道》及其游戏文本、角色、素材的版权归米哈游所有，本仓库是爱好者项目，
+与米哈游无任何关联；仓库不附带游戏数据（`data/` 不入库，由 `scripts/fetch_data.ps1` 从第三方数据仓库
+`DimbreathBot/TurnBasedGameData` 拉取）；`tests/fixtures` 里仅有少量游戏文本片段，用于测试。

@@ -29,7 +29,7 @@
 | 项目 | 状态 |
 |---|---|
 | Git 分支 | `feat/pom-pom-agent`（62 个提交，工作区干净；尚未合并 main，无远程） |
-| 自动化测试 | **165 passed**（`pytest`，结果自动存 `test-results/`） |
+| 自动化测试 | **168 passed**（`pytest`，结果自动存 `test-results/`） |
 | 统一评测集 | `eval/testset.json` 65 题 / 10 轴：快档 **28/30**、普通档 **28/29**、深度档 **6/6**（3 条已知缺口记录在案） |
 | 实体探针 | **25/25 命中**，平均返回 9.0 条、同场景最多平均 1.56（已并入统一集，脚本保留兼容） |
 | 深度思考模式 | 已上线：ReAct 工具循环 + SSE 思考轨迹；真实链路 smoke **5/5 PASS**（`test-results/latest-deep-smoke.md`） |
