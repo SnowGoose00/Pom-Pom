@@ -1,0 +1,53 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.pytest_tmp/
+test-results/
+tools/
+
+# Env & secrets — 只有 .env.example 允许提交
+.env
+.env.*
+!.env.example
+
+# Data (fetched/extracted/generated)
+data/
+data/StarRailData/
+data/dialogues/
+data/models/
+data/*.db
+data/*.db-*
+data/*.bak
+data/pom.db.pre-*
+
+# Binaries & archives（cloudflared.exe 曾误入库，这类文件一律不进 git）
+*.exe
+*.dll
+*.so
+*.dylib
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.whl
+*.bak
+
+# Logs & caches
+*.log
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

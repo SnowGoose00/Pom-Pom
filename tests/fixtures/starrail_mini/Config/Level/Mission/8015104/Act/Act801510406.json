@@ -1,0 +1,14 @@
+{
+  "OnStartSequece": [
+    {
+      "TaskList": [
+        {"$type": "RPG.GameCore.PlayAndWaitSimpleTalk", "SimpleTalkList": [
+          {"TalkSentenceID": 7001},
+          {"TalkSentenceID": 7002},
+          {"TalkSentenceID": 7003}
+        ]},
+        {"$type": "RPG.GameCore.EndPerformance"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+[
+  {"TalkSentenceID": 5001, "TextmapTalkSentenceName": {"Hash": 100}, "TalkSentenceText": {"Hash": 101}},
+  {"TalkSentenceID": 5002, "TextmapTalkSentenceName": {"Hash": 102}, "TalkSentenceText": {"Hash": 103}},
+  {"TalkSentenceID": 6001, "TextmapTalkSentenceName": {"Hash": 106}, "TalkSentenceText": {"Hash": 107}},
+  {"TalkSentenceID": 7001, "TextmapTalkSentenceName": {"Hash": 170}, "TalkSentenceText": {"Hash": 171}},
+  {"TalkSentenceID": 7002, "TalkSentenceText": {"Hash": 172}},
+  {"TalkSentenceID": 7003, "TextmapTalkSentenceName": {"Hash": 173}, "TalkSentenceText": {"Hash": 174}},
+  {"TalkSentenceID": 8001, "TextmapTalkSentenceName": {"Hash": 180}, "TalkSentenceText": {"Hash": 181}},
+  {"TalkSentenceID": 8002, "TextmapTalkSentenceName": {"Hash": 104}, "TalkSentenceText": {"Hash": 183}}
+]

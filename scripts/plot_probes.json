@@ -1,0 +1,44 @@
+[
+  {
+    "id": "pam_identity",
+    "question": "你好，你是谁？",
+    "must_any": ["帕姆", "列车长"],
+    "avoid": []
+  },
+  {
+    "id": "jizi_role",
+    "question": "姬子在星穹列车担任什么职务？",
+    "must_any": ["领航员", "修复"],
+    "avoid": ["舰长", "摇滚明星"]
+  },
+  {
+    "id": "jizi_pom_relation",
+    "question": "帕姆和姬子是什么关系？",
+    "must_any": ["乘客", "伙伴", "同事", "朋友", "修理师", "独一无二", "关系很好", "重要的一员"],
+    "avoid": ["摇滚明星", "舰长"]
+  },
+  {
+    "id": "crew_members",
+    "question": "星穹列车的列车组成员有哪些？",
+    "must_all": ["姬子", "三月七", "丹恒"],
+    "avoid": ["舰长"]
+  },
+  {
+    "id": "herta_station_owner",
+    "question": "黑塔空间站是谁建造的？",
+    "must_any": ["黑塔"],
+    "avoid": ["艾丝妲建造", "艾丝妲建的", "艾丝妲所建", "艾丝妲修建", "艾丝妲创建的"]
+  },
+  {
+    "id": "wuxu_zhimu_identity",
+    "question": "虚妄之母是谁？",
+    "must_any": ["大守护者", "守护者", "歌者", "星核"],
+    "avoid": []
+  },
+  {
+    "id": "visited_worlds",
+    "question": "星穹列车到访过哪些世界？",
+    "must_any": ["雅利洛", "匹诺康尼", "仙舟", "翁法罗斯", "贝洛伯格"],
+    "avoid": ["位面球"]
+  }
+]

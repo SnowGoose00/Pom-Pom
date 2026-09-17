@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>星穹列车 · 帕姆聊天室</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="train-header">
+    <div class="header-left">
+      <div class="pom-avatar" aria-label="帕姆头像">
+        <span class="ear left"></span>
+        <span class="ear right"></span>
+        <div class="face">
+          <div class="eyes"><span></span><span></span></div>
+          <div class="mouth"></div>
+        </div>
+        <div class="cap"></div>
+      </div>
+      <div class="header-text">
+        <h1>星穹列车 · 帕姆聊天室</h1>
+        <p class="status" id="status">正在连接列车广播……</p>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="train-name">ASTRAL EXPRESS</div>
+      <button id="clear" class="clear-btn" type="button" title="清空当前对话（不影响列车智库）">清空对话</button>
+    </div>
+  </header>
+
+  <main id="chat" class="chat" aria-live="polite"></main>
+
+  <form id="composer" class="composer">
+    <input id="input" type="text" placeholder="对帕姆说点什么，开拓者……" autocomplete="off" maxlength="2000">
+    <label class="deep-toggle" title="让帕姆反复查智库和星间情报，查够了再回答">
+      <input type="checkbox" id="deep">
+      <span>深度思考</span>
+    </label>
+    <button type="submit" id="send">发送</button>
+  </form>
+
+  <script src="/app.js"></script>
+</body>
+</html>

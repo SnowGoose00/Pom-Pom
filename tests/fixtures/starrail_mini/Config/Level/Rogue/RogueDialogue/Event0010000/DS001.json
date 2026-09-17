@@ -1,0 +1,15 @@
+{
+  "OnStartSequece": [
+    {
+      "TaskList": [
+        {"$type": "RPG.GameCore.PlayRogueSimpleTalk", "SimpleTalkList": [
+          {"TalkSentenceID": 8002}
+        ]},
+        {"$type": "RPG.GameCore.PlayRogueOptionTalk", "OptionList": [
+          {"RogueOptionID": 10001, "OptionTextmapID": {"Hash": 183}}
+        ]},
+        {"$type": "RPG.GameCore.EndPerformance"}
+      ]
+    }
+  ]
+}

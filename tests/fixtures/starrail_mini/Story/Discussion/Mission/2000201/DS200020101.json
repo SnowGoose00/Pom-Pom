@@ -1,0 +1,11 @@
+{
+  "OnStartSequece": [
+    {
+      "TaskList": [
+        {"$type": "RPG.GameCore.PlayOptionTalk", "OptionList": [
+          {"TalkSentenceID": 5002, "TriggerCustomString": "TalkSentence_5002"}
+        ]}
+      ]
+    }
+  ]
+}

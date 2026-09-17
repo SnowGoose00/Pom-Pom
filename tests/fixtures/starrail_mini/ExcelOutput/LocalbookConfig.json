@@ -1,0 +1,9 @@
+[
+  {
+    "BookID": 7001,
+    "BookSeriesInsideID": 1,
+    "BookInsideName": {"Hash": 201},
+    "BookContent": {"Hash": 202},
+    "BookDisplayType": 1
+  }
+]

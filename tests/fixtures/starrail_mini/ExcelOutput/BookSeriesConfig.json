@@ -1,0 +1,5 @@
+[{"BookSeriesID": 7,
+  "BookSeriesName": {"Hash": 108},
+  "BookSeriesDesc": {"Hash": 109},
+  "BookItems": [{"BookItemName": {"Hash": 108}, "BookContent": {"Hash": 109}}]
+}]
