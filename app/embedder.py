@@ -22,6 +22,19 @@ class Embedder:
             self._model = TextEmbedding(**kwargs)
         return self._model
 
+    @property
+    def ready(self) -> bool:
+        """True only once the ONNX model is actually loaded."""
+        return self._model is not None
+
+    def ensure_loaded(self) -> None:
+        """Load the model now instead of on first use.
+
+        The model is loaded lazily, so without this a broken install looks
+        healthy until the first question fails.
+        """
+        self._ensure_model()
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []

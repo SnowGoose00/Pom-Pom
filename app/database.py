@@ -108,27 +108,42 @@ class VectorDB:
             self.conn.execute("DELETE FROM segments")
             self.conn.commit()
 
-    def insert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
-        with self._lock:
-            rows = []
-            vec_rows = []
-            for chunk, emb in zip(chunks, embeddings):
-                if len(emb) != self.dim:
-                    raise ValueError(f"expected dim {self.dim}, got {len(emb)}")
-                embedding_id = chunk.id
-                rows.append(
-                    (
-                        chunk.id,
-                        chunk.category,
-                        chunk.scene,
-                        chunk.speaker,
-                        chunk.text,
-                        int(chunk.pom_pom),
-                        chunk.meta,
-                        embedding_id,
-                    )
+    def _build_rows(
+        self, chunks: list[Chunk], embeddings: list[list[float]]
+    ) -> tuple[list[tuple], list[tuple]]:
+        """Validate inputs and turn them into the two row lists we insert.
+
+        Everything is checked *before* any write, so a bad batch can never leave
+        a half-written store behind.
+        """
+        if len(chunks) != len(embeddings):
+            raise ValueError(
+                f"got {len(chunks)} chunks but {len(embeddings)} embeddings"
+            )
+        rows = []
+        vec_rows = []
+        for chunk, emb in zip(chunks, embeddings):
+            if len(emb) != self.dim:
+                raise ValueError(f"expected dim {self.dim}, got {len(emb)}")
+            embedding_id = chunk.id
+            rows.append(
+                (
+                    chunk.id,
+                    chunk.category,
+                    chunk.scene,
+                    chunk.speaker,
+                    chunk.text,
+                    int(chunk.pom_pom),
+                    chunk.meta,
+                    embedding_id,
                 )
-                vec_rows.append((embedding_id, json.dumps(emb)))
+            )
+            vec_rows.append((embedding_id, json.dumps(emb)))
+        return rows, vec_rows
+
+    def insert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+        rows, vec_rows = self._build_rows(chunks, embeddings)
+        with self._lock:
             self.conn.executemany(
                 "INSERT INTO segments (id, category, scene, speaker, text, pom_pom, meta, embedding_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -138,6 +153,32 @@ class VectorDB:
                 "INSERT INTO vec_segments (rowid, embedding) VALUES (?, ?)",
                 vec_rows,
             )
+            self.conn.commit()
+
+    def replace_all(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
+        """Swap in a whole new knowledge base in one transaction.
+
+        A rebuild that fails part-way (bad vector, disk error) must leave the
+        previous knowledge base intact -- ``clear()`` + ``insert_chunks()``
+        commits the wipe first, so a later failure loses both.
+        """
+        rows, vec_rows = self._build_rows(chunks, embeddings)
+        with self._lock:
+            try:
+                self.conn.execute("DELETE FROM vec_segments")
+                self.conn.execute("DELETE FROM segments")
+                self.conn.executemany(
+                    "INSERT INTO segments (id, category, scene, speaker, text, pom_pom, meta, embedding_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+                self.conn.executemany(
+                    "INSERT INTO vec_segments (rowid, embedding) VALUES (?, ?)",
+                    vec_rows,
+                )
+            except Exception:
+                self.conn.rollback()
+                raise
             self.conn.commit()
 
     def search(
@@ -306,18 +347,36 @@ class VectorDB:
         """
         with self._lock:
             row = self.conn.execute(
-                "SELECT category, scene FROM segments WHERE id = ?", (chunk_id,)
+                "SELECT category, scene, meta FROM segments WHERE id = ?", (chunk_id,)
             ).fetchone()
             if not row:
                 return []
-            category, scene = row
-            rows = self.conn.execute(
-                "SELECT id, category, scene, speaker, text, pom_pom, meta FROM segments "
-                "WHERE category = ? AND scene = ? AND id BETWEEN ? AND ? AND id != ? "
-                "ORDER BY id",
-                (category, scene, chunk_id - before, chunk_id + after, chunk_id),
-            ).fetchall()
-        return [Chunk(*row) for row in rows]
+            category, scene, meta = row
+            # 同一个片段如果在别的场景也出现过，导入去重时它会并入 aliases，
+            # 这里把那些场景的上下文一并取回，避免被合并掉的场景查不到前后句。
+            windows = [(scene, chunk_id)]
+            try:
+                parsed = json.loads(meta or "{}")
+            except json.JSONDecodeError:
+                parsed = {}
+            windows += list(
+                zip(parsed.get("aliases") or [], parsed.get("alias_ids") or [])
+            )
+            seen_ids = {chunk_id}
+            out: list[Chunk] = []
+            for target_scene, anchor in windows:
+                rows = self.conn.execute(
+                    "SELECT id, category, scene, speaker, text, pom_pom, meta FROM segments "
+                    "WHERE category = ? AND scene = ? AND id BETWEEN ? AND ? AND id != ? "
+                    "ORDER BY id",
+                    (category, target_scene, anchor - before, anchor + after, chunk_id),
+                ).fetchall()
+                for row_item in rows:
+                    if row_item[0] in seen_ids:
+                        continue
+                    seen_ids.add(row_item[0])
+                    out.append(Chunk(*row_item))
+        return out
 
     def search_text_terms(
         self,

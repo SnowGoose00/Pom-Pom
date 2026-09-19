@@ -48,6 +48,10 @@ htmlcov/
 .vscode/
 *.swp
 
+# 本地评审／笔记：保留在磁盘，但不进版本库、不随发布上传
+Pom-Pom-review.md
+Pom-Pom-functional-review.md
+
 # OS
 .DS_Store
 Thumbs.db

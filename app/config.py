@@ -30,6 +30,12 @@ class Settings:
     deep_think_fetch_enabled: bool = True
     web_search_sources: tuple[str, ...] = ("bocha", "duckduckgo", "so360", "sogou")
     bocha_api_key: str = ""
+    # 公网部署护栏：access_token 为空 = 不校验（本地使用行为不变）
+    access_token: str = ""
+    rate_limit_per_minute: int = 20
+    max_history_messages: int = 40
+    max_history_chars: int = 20000
+    max_message_chars: int = 2000
 
 
 def load_settings() -> Settings:
@@ -70,4 +76,9 @@ def load_settings() -> Settings:
             if source.strip()
         ),
         bocha_api_key=(os.getenv("BOCHA_API_KEY") or "").strip(),
+        access_token=(os.getenv("POM_ACCESS_TOKEN") or "").strip(),
+        rate_limit_per_minute=int(os.getenv("POM_RATE_LIMIT_PER_MINUTE", "20")),
+        max_history_messages=int(os.getenv("POM_MAX_HISTORY_MESSAGES", "40")),
+        max_history_chars=int(os.getenv("POM_MAX_HISTORY_CHARS", "20000")),
+        max_message_chars=int(os.getenv("POM_MAX_MESSAGE_CHARS", "2000")),
     )

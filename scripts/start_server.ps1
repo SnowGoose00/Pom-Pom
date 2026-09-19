@@ -24,7 +24,8 @@ param(
     [switch]$Background,
     [switch]$Public,
     [switch]$Stop,
-    [switch]$NoStopExisting
+    [switch]$NoStopExisting,
+    [string]$Token = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,33 +37,87 @@ $ProbeHost = if ($BindHost -eq "0.0.0.0" -or $BindHost -eq "::") { "127.0.0.1" }
 $TunnelExe = Join-Path $Root "tools\cloudflared.exe"
 $TunnelOut = Join-Path $ResultDir "cloudflared.out.log"
 $TunnelErr = Join-Path $ResultDir "cloudflared.err.log"
+$ServerPidFile = Join-Path $ResultDir "pom-server.pid"
+$TunnelPidFile = Join-Path $ResultDir "pom-tunnel.pid"
 
-function Get-PomServerProcesses {
-    Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
-        Where-Object {
-            $_.CommandLine -like "*uvicorn*" -and
-            $_.CommandLine -like "*app.main:app*" -and
-            $_.CommandLine -like "*--port $Port*"
-        }
+function Test-PomCommandLine([string]$CommandLine, [string]$Kind) {
+    # Strict on purpose: a command line that merely mentions this directory (any
+    # python started from here, ours or not) must never be treated as the server.
+    if (-not $CommandLine) { return $false }
+    if ($CommandLine.IndexOf($Root, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+    if ($Kind -eq "tunnel") {
+        return ($CommandLine -like "*cloudflared*") -and
+        ($CommandLine -like "*--url http://127.0.0.1:$Port*")
+    }
+    if ($CommandLine -notlike "*uvicorn*") { return $false }
+    if ($CommandLine -notlike "*app.main:app*") { return $false }
+    # Exact port: "--port 80" must not answer for 8000.
+    return [bool]($CommandLine -match ('--port\s+{0}(\s|$)' -f $Port))
 }
 
-function Get-PomTunnelProcesses {
-    Get-CimInstance Win32_Process -Filter "Name = 'cloudflared.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*--url http://127.0.0.1:$Port*" }
+function Test-PomOwned([int]$TargetId, [string]$Kind) {
+    # A venv python re-execs the base interpreter, so the real listener may not
+    # have the project path in its own command line -- check its launcher too.
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $TargetId" -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    if (Test-PomCommandLine $proc.CommandLine $Kind) { return $true }
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.ParentProcessId)" -ErrorAction SilentlyContinue
+    if (-not $parent -or $parent.Name -ne "python.exe") { return $false }
+    return (Test-PomCommandLine $parent.CommandLine $Kind)
+}
+
+function Get-RecordedPids([string]$File) {
+    if (-not (Test-Path $File)) { return @() }
+    $raw = Get-Content $File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $value = 0
+    if ([int]::TryParse($raw, [ref]$value) -and $value -gt 0) { return @($value) }
+    return @()
+}
+
+function Test-PortBusy([int]$Port) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $client.Connect("127.0.0.1", $Port)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
 }
 
 function Stop-PomServer {
-    $procs = @(Get-PomServerProcesses) + @(Get-PomTunnelProcesses)
-    if ($procs.Count -eq 0) {
-        Write-Host "No Pom-Pom server running on port $Port."
-        return
+    $stopped = 0
+    foreach ($entry in @(
+            @{ File = $ServerPidFile; Label = "server"; Kind = "server" },
+            @{ File = $TunnelPidFile; Label = "tunnel"; Kind = "tunnel" })) {
+        foreach ($targetId in Get-RecordedPids $entry.File) {
+            if (Test-PomOwned $targetId $entry.Kind) {
+                Write-Host "Stopping $($entry.Label) process $targetId ..."
+                Stop-Process -Id $targetId -Force -ErrorAction SilentlyContinue
+                $stopped++
+            } else {
+                Write-Host "Pid $targetId in $($entry.Label) pid file is not ours any more; leaving it alone."
+            }
+        }
+        Remove-Item -LiteralPath $entry.File -ErrorAction SilentlyContinue
     }
-    foreach ($proc in $procs) {
-        Write-Host "Stopping process $($proc.ProcessId) ..."
-        Stop-Process -Id $proc.ProcessId -Force
-    }
+    # A launcher may have left the real listener behind; take it back only if its
+    # command line still points at this project.
     Start-Sleep -Seconds 2
-    Write-Host "Stopped."
+    if (Test-PortBusy $Port) {
+        $owner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty OwningProcess
+        if ($owner -and (Test-PomOwned $owner "server")) {
+            Write-Host "Stopping lingering listener $owner ..."
+            Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+            $stopped++
+            Start-Sleep -Seconds 1
+        }
+    }
+    if ($stopped -eq 0) {
+        Write-Host "No recorded Pom-Pom server to stop."
+    }
 }
 
 function Start-PomTunnel([int]$Seconds = 45) {
@@ -71,11 +126,13 @@ function Start-PomTunnel([int]$Seconds = 45) {
         return ""
     }
     New-Item -ItemType Directory -Force -Path $ResultDir | Out-Null
-    Start-Process -FilePath $TunnelExe `
+    $tunnelProc = Start-Process -FilePath $TunnelExe `
         -ArgumentList @("tunnel", "--url", "http://127.0.0.1:$Port", "--no-autoupdate") `
         -WindowStyle Hidden `
+        -PassThru `
         -RedirectStandardOutput $TunnelOut `
         -RedirectStandardError $TunnelErr
+    if ($tunnelProc) { $tunnelProc.Id | Out-File -FilePath $TunnelPidFile -Encoding ascii }
     for ($i = 0; $i -lt $Seconds; $i++) {
         Start-Sleep -Seconds 1
         foreach ($file in @($TunnelErr, $TunnelOut)) {
@@ -128,12 +185,37 @@ if (-not $NoStopExisting) {
     Stop-PomServer
 }
 
+if (Test-PortBusy $Port) {
+    # An instance started by an older version has no pid file; accept it only if
+    # its command line points at this project, otherwise leave it alone.
+    $owner = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty OwningProcess
+    if ($owner -and (Test-PomOwned $owner "server")) {
+        Write-Host "Port $Port is held by this project (pid $owner); stopping it."
+        Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+}
+
+if (Test-PortBusy $Port) {
+    Write-Host "Port $Port is already in use by a process that is not this project."
+    Write-Host "Stop it yourself, or pick another port with -Port."
+    exit 1
+}
+
 if ($Public) {
     # 隧道要在后台跑，所以 -Public 强制后台模式
     $Background = $true
 }
 
 $env:PYTHONIOENCODING = "utf-8"
+if ($Token) {
+    # Access token: without it anyone who has the public link can spend your quota.
+    $env:POM_ACCESS_TOKEN = $Token
+    Write-Host "Access token enabled. Share the link with #token=<your token> appended."
+} else {
+    $env:POM_ACCESS_TOKEN = ""
+}
 if ($Debug) {
     $env:DEBUG = "true"
 } else {
@@ -147,9 +229,11 @@ Push-Location $Root
 try {
     if ($Background) {
         New-Item -ItemType Directory -Force -Path $ResultDir | Out-Null
-        Start-Process -FilePath $Python -ArgumentList $UvicornArgs -WindowStyle Hidden `
+        $serverProc = Start-Process -FilePath $Python -ArgumentList $UvicornArgs -WindowStyle Hidden `
+            -PassThru `
             -RedirectStandardOutput (Join-Path $ResultDir "server-debug.out.log") `
             -RedirectStandardError (Join-Path $ResultDir "server-debug.err.log")
+        if ($serverProc) { $serverProc.Id | Out-File -FilePath $ServerPidFile -Encoding ascii }
         Wait-Health -Seconds 90 | Out-Null
         if ($Public) {
             Write-Host "Starting Cloudflare quick tunnel ..."

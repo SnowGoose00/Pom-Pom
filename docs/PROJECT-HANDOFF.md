@@ -36,7 +36,7 @@
 | 联网攻略 | 多源链 **博查（带 key，优先）→ DuckDuckGo → 360 → 搜狗**，节流/冷却/缓存齐备 |
 | 剧情事实探针 | **7/7 PASS**（重建库后重跑，`test-results/latest-plot-probes.md`） |
 | 18 题验收 | 16 题正常 + 2 题因当时限流重试后兜底（`test-results/acceptance-2026-09-03_223323.md`） |
-| 知识库 | 260,577 条记录 → **102,243 个向量片段**（SQLite + sqlite-vec，231.3 MB） |
+| 知识库 | 271,061 条记录 → **109,446 个向量片段**（SQLite + sqlite-vec，247.8 MB；2026-09-19 重建） |
 | 对话覆盖率 | `TalkSentenceConfig` 240,488 条对话，本地能引用到 **125,518 条（52.2%）**，扩充前是 7.5% |
 | 当前运行状态 | 本地服务运行中（`127.0.0.1:8000`，2026-09-14 21:0x 重启）；无 cloudflared 进程，公网链接已失效 |
 
@@ -283,11 +283,57 @@ Ragas（测试集要素与防漂移）。本项目落了 10 个轴：
 
 数据源：`DimbreathBot/TurnBasedGameData`（中文 CHS）。
 
+**功能评审修复（2026-09-18）**：按 `Pom-Pom-functional-review.md` 的 8 条问题逐条修，顺序照它给的优先级。
+每条都先写会失败的测试（RED）再改代码（GREEN），新增 11 条测试（168 → **179 passed**）。
+
+| # | 问题 | 修法 | 覆盖它的测试 |
+|---|---|---|---|
+| 1 | 记忆只有说明的一半：`history[-turns]` 只留 20 条消息（10 轮） | 按轮换算成 `history[-2*turns:]`，普通与深度模式一致 | `test_history_keeps_two_messages_per_configured_turn` |
+| 2 | 当前问题被送两次：前端先写进 history，后端又追加一次 | 会话状态移入 `static/chat-core.js`，`outgoing()` 去掉尾部重复的当前问题 | `frontend_core.test.js` |
+| 3 | 清空对话后旧回答仍写入 DOM／localStorage／下一轮 history | 清空时 abort 在途请求并递增 generation，回复回来发现过期就丢弃 | 同上 |
+| 4 | 知识库重建不是原子操作，失败会丢旧库 | 新增 `VectorDB.replace_all()`：先校验再在同一事务里替换 | `test_failed_reimport_keeps_the_previous_knowledge_base` |
+| 4b | 向量条数不匹配被静默接受（返回 1 条、库里 0 条） | 校验条数与维度，不一致直接报错 | `test_import_rejects_embedding_count_mismatch` |
+| 5 | Rogue 配置在提取阶段被截断到 1500 字，末尾条目丢失 | 逐条提取（scene 变成 `RogueBuff.3` 这样），不再按文件拼接 | `test_rogue_config_entries_survive_the_whole_file` |
+| 6 | 跨场景去重只记场景名，邻接检索取不到被合并场景的上下文 | 去重时同时记 `alias_ids`，`scene_neighbors` 顺着别名场景再取一遍 | `test_neighbours_reach_the_scene_that_dedupe_removed` |
+| 7 | 页面显示在线但发消息 500：embedder 懒加载，健康检查提前报就绪 | 启动时 `ensure_loaded()`；`/api/health` 新增 `status`（空库或 embedder 未就绪即 `degraded`），引擎未就绪时接口返回 503 | `test_server_reports_degraded_instead_of_500_when_the_embedder_fails` |
+| 8 | 深度模式总时限只在轮次之间检查，超时后仍会开新工具 | 每个工具执行前检查剩余预算，未执行的调用也补一条观察结果 | `test_budget_stops_further_tools_inside_one_round` |
+
+**要注意**：第 5、6 条改的是提取与切块逻辑，**现有知识库要重建才会生效**（重跑提取＋导入，约 35 分钟）。
+第 1、2、3、4、7、8 条改的是服务端与前端行为，重启即生效。
+
+**仍未处理**：同目录 `Pom-Pom-review.md`（安全审查）里的 3 条 P1 —— 网页抓取的 SSRF 限制可绕过、
+并发请求共用引擎状态导致串话、公网部署没有鉴权与配额；以及 P2 的伪造 system 消息、抓取响应体无限读取、
+密钥扫描假阴性、启动脚本可能误杀其他进程、搜索缓存不过期。本轮只按功能评审施工。
+
+**安全性修复（2026-09-18/19）**：上面的 P1 与 P2 清单已全部处理完（令牌鉴权＋限速＋请求体护栏、
+每请求状态、SSRF 逐跳校验、抓取流式限流、密钥扫描改查 index、启动脚本按 PID＋精确参数判定归属），
+细节见 `SECURITY.md`。剩下的只有两项长期运行类问题：搜索缓存不过期、玩家选项台词会经
+seeds／邻居扩展回到上下文。两份评审文档已从版本库摘出（留在磁盘、加进 `.gitignore`），不随发布上传。
+
+**知识库重建（2026-09-19）**：为让第 5、6 条生效重跑了提取＋入库（`scripts/rebuild_knowledge_base.py`，
+32.2 分钟）：
+
+| 指标 | 重建前 | 重建后 |
+|---|---:|---:|
+| 提取记录 | 260,577 | **271,061** |
+| 向量片段 | 102,243 | **109,446** |
+| 其中 rogue | 2,407 | **9,610** |
+| 库体积 | 231.3 MB | **247.8 MB** |
+
+多出来的 7,203 个 rogue 片段正是以前被 `[:1500]` 截掉的配置条目；scene 现在按条目命名
+（`RogueBuff.14`），去重片段的 6,009 条 `alias_ids` 也已就位。回归无退化：单测 192 passed、
+实体探针 25/25（同场景最多平均 1.52，比之前 1.56 略好）、评测快档 28/30（两条已知缺口不变）。
+实测末尾条目可被内容检索命中（旧逻辑会整条丢弃）。旧库备份在 `data/pom.db.pre-rebuild.bak`。
+
+一个观察：新增的 rogue 片段里有 3,652 条含 `#1`／`#2` 占位符（其中 1,671 条来自
+`RogueDialogueOptionDisplay` 的选项显示文本）。之前定过"占位符文本不入库"的原则，但本轮按评审要求
+先保证不丢内容；评测未见退化，若之后发现这几条干扰检索，可在提取时排除占位符条目（需再重建一次）。
+
 ```powershell
 # 1) 拉取最小数据集（约 80–100MB）
 powershell -ExecutionPolicy Bypass -File scripts/fetch_data.ps1
 
-# 2) 提取八类语料
+# 2) 提取 13 类语料
 .venv\Scripts\python.exe -c "from app.extract import extract_all; extract_all('data/StarRailData','data/dialogues')"
 
 # 3) 向量化入库存

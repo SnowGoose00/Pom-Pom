@@ -62,6 +62,7 @@ _DSML_MARKUP_BLOCK_RE = re.compile(
 )
 _MAX_TEXT_TOOL_NUDGES = 2
 _MAX_FINALIZE_ATTEMPTS = 2
+_BUDGET_OBSERVATION = "（时间预算用完了帕，这次不再查新资料，直接用已经查到的内容作答）"
 
 _TEXT_TOOL_INSTRUCTION = (
     "不要用文字写出工具调用（尖括号标记那一类），要用就直接调用工具功能；"
@@ -283,6 +284,24 @@ class DeepThinkEngine:
             messages.append(_assistant_message(message))
             gained = 0
             for call in calls:
+                name = str(getattr(getattr(call, "function", None), "name", "") or "")
+                if self._now() >= deadline:
+                    # 预算已经用完：不再执行剩余工具，但每个工具调用仍要有一个观察结果，
+                    # 否则模型收到的是一段没有回应的工具调用序列。
+                    observation = _BUDGET_OBSERVATION
+                    step = self._step(
+                        state, name, _summary_input(name, {}), 0, 0, observation
+                    )
+                    state.steps.append(step)
+                    yield {"type": "step", **step}
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": getattr(call, "id", ""),
+                            "content": observation,
+                        }
+                    )
+                    continue
                 step, observation, new_evidence = self._execute(call, state)
                 messages.append(
                     {
@@ -296,7 +315,7 @@ class DeepThinkEngine:
                 gained += new_evidence
             state.stalled = state.stalled + 1 if gained == 0 else 0
             _append_voice_reminder(messages)
-            if state.stalled >= 2:
+            if state.stalled >= 2 or self._now() >= deadline:
                 break
 
         if not reply:
@@ -318,7 +337,8 @@ class DeepThinkEngine:
             samples, max_steps=int(self.settings.deep_think_max_steps)
         )
         limit = max(0, self.settings.history_turns)
-        trimmed = history[-limit:] if limit else []
+        # 一轮 = 用户 + 帕姆两条消息，保持与普通模式一致
+        trimmed = history[-2 * limit:] if limit else []
         return [
             {"role": "system", "content": system},
             *trimmed,

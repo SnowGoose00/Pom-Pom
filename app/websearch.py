@@ -6,10 +6,12 @@ DuckDuckGo HTML (best relevance, rate limited) -> 360 搜索 (steady) -> 搜狗 
 from __future__ import annotations
 
 import html as html_lib
+import ipaddress
 import os
 import re
+import socket
 import time
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlsplit
 
 import httpx
 
@@ -424,11 +426,47 @@ _JS_REDIRECT = re.compile(r"location\.replace\(\s*[\"']([^\"']+)[\"']")
 _META_REDIRECT = re.compile(r"URL=['\"]?([^'\"\s>]+)", re.I)
 
 
+_MAX_REDIRECTS = 3
+_MAX_PAGE_BYTES = 512_000
+_TEXTUAL_TYPES = ("text/", "application/json", "application/xml", "application/xhtml")
+
+
+def _resolve_public(host: str) -> str | None:
+    """Resolve ``host`` and return one address to use, or None if it is not public.
+
+    Every answer returned by the resolver must be a public address: if a name
+    points at both a public and a private address, the whole name is refused.
+    Going through the resolver also normalises the tricks that fool naive string
+    checks (``2130706433``, ``0x7f000001``, ``[::1]`` all come back as addresses).
+    """
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return None
+    addresses: list[str] = []
+    for info in infos:
+        address = info[4][0].split("%")[0]  # drop any IPv6 scope id
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return None
+        if not ip.is_global:
+            return None
+        addresses.append(address)
+    return addresses[0] if addresses else None
+
+
 def _is_public_http(url: str) -> bool:
-    """Only allow public http(s) URLs; never touch the host machine."""
-    if not url or not url.lower().startswith(("http://", "https://")):
+    """Only allow http(s) URLs whose host resolves to a public address."""
+    if not url:
         return False
-    return not any(host in url.lower() for host in _BLOCKED_HOSTS)
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    return _resolve_public(parsed.hostname) is not None
 
 
 def _redirect_target(page: str) -> str:
@@ -436,6 +474,18 @@ def _redirect_target(page: str) -> str:
     match = _JS_REDIRECT.search(page) or _META_REDIRECT.search(page)
     target = match.group(1).strip() if match else ""
     return target if _is_public_http(target) else ""
+
+
+def _read_limited(response, limit: int) -> bytes:
+    """Read at most ``limit`` bytes and then stop pulling from the socket."""
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes():
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= limit:
+            break
+    return b"".join(chunks)[:limit]
 
 
 def html_to_text(page: str) -> str:
@@ -451,28 +501,54 @@ def html_to_text(page: str) -> str:
 
 
 def fetch_page_text(url: str, max_chars: int = 4000, timeout: float = 10.0) -> str:
-    """Fetch a public http(s) page and return its plain text; "" on any failure."""
-    if not _is_public_http(url):
-        return ""
-    try:
-        resp = httpx.get(
-            url,
-            headers={"User-Agent": _UA},
-            timeout=timeout,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
-        page = resp.text
-        target = _redirect_target(page)
-        if target:
-            resp = httpx.get(
-                target,
+    """Fetch a public http(s) page and return its plain text; "" on any failure.
+
+    Redirects are followed by hand so that **every** hop is re-checked: with
+    ``follow_redirects=True`` a public URL can bounce the fetcher into the local
+    network, which is what made the old address check useless.
+
+    The body is streamed and cut off at ``_MAX_PAGE_BYTES`` and non-textual
+    responses are skipped: fetching everything and truncating afterwards let a
+    large page (or a compressed bomb) eat memory and a worker thread.
+    """
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        if not _is_public_http(current):
+            return ""
+        try:
+            with httpx.stream(
+                "GET",
+                current,
                 headers={"User-Agent": _UA},
                 timeout=timeout,
-                follow_redirects=True,
-            )
-            resp.raise_for_status()
-            page = resp.text
+                follow_redirects=False,
+            ) as resp:
+                status = getattr(resp, "status_code", 200)
+                if 300 <= status < 400:
+                    location = (getattr(resp, "headers", None) or {}).get(
+                        "location", ""
+                    )
+                    if not location:
+                        return ""
+                    current = urljoin(current, location)
+                    continue
+                resp.raise_for_status()
+                content_type = (getattr(resp, "headers", None) or {}).get(
+                    "content-type", ""
+                )
+                if content_type and not any(
+                    kind in content_type.lower() for kind in _TEXTUAL_TYPES
+                ):
+                    return ""
+                page = _read_limited(resp, _MAX_PAGE_BYTES).decode(
+                    getattr(resp, "encoding", None) or "utf-8", errors="replace"
+                )
+        except Exception:
+            return ""
+        # Search engines return a tiny JS/meta redirect page instead of a 3xx.
+        target = _redirect_target(page)
+        if target:
+            current = target
+            continue
         return html_to_text(page)[:max_chars]
-    except Exception:
-        return ""
+    return ""

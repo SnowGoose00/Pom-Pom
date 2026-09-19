@@ -164,7 +164,7 @@ def validate_answer(case: dict, reply: str, *, steps=None, web_titles=None):
 
 def run_fast(engine, case: dict) -> dict:
     started = time.time()
-    chunks = engine._retrieve(case["question"])
+    chunks = engine._retrieve(case["question"], {})
     checks = validate_context(case, chunks)
     return {
         "reply": "",
@@ -180,7 +180,9 @@ def run_llm(engine, case: dict) -> dict:
     started = time.time()
     reply = engine.reply(case["question"], [])
     stats = getattr(engine, "_stats", {}) or {}
-    chunks = engine._retrieve(case["question"]) if case.get("context_any") else []
+    chunks = (
+        engine._retrieve(case["question"], {}) if case.get("context_any") else []
+    )
     checks = validate_answer(case, reply, web_titles=stats.get("web_titles"))
     checks += validate_context(case, chunks)
     return {

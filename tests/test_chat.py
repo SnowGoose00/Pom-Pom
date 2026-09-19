@@ -73,7 +73,7 @@ def test_reply_returns_llm_output_and_trims_history(tmp_path):
     llm = FakeLLM()
     engine = ChatEngine(settings, db, FakeEmbedder(), llm_client=llm)
 
-    history = [{"role": "user", "content": "前一轮"} for _ in range(25)]
+    history = [{"role": "user", "content": f"前一轮{i}"} for i in range(50)]
     reply = engine.reply("列车去过哪些星球？", history)
 
     assert "雅利洛-VI" in reply
@@ -81,9 +81,79 @@ def test_reply_returns_llm_output_and_trims_history(tmp_path):
     messages = last_call["messages"]
     assert messages[0]["role"] == "system"
     assert "雅利洛-VI" in messages[0]["content"]
-    assert len([m for m in messages if m["role"] == "user"]) <= 21  # 20 turns + current
+    sent = [m for m in messages if m["role"] == "user"]
+    assert len(sent) == 41  # 20 turns (40 messages) + the current question
+    assert sent[0]["content"] == "前一轮10"  # oldest kept message
     assert last_call["model"] == "test-model"
     assert last_call["timeout"] == 120
+    db.close()
+
+def test_history_keeps_two_messages_per_configured_turn(tmp_path):
+    """HISTORY_TURNS counts turns: 2 turns means 4 messages, not 2."""
+    settings = replace(_settings(tmp_path), history_turns=2)
+    db = VectorDB(tmp_path / "t.db", dim=4)
+    llm = FakeLLM()
+    engine = ChatEngine(settings, db, FakeEmbedder(), llm_client=llm)
+    history = []
+    for turn in range(1, 4):
+        history.append({"role": "user", "content": f"问题{turn}"})
+        history.append({"role": "assistant", "content": f"回答{turn}"})
+
+    engine.reply("问题4", history)
+
+    sent = [m["content"] for m in llm.calls[-1]["messages"] if m["role"] != "system"]
+    assert sent == ["问题2", "回答2", "问题3", "回答3", "问题4"]
+    db.close()
+
+
+def test_diagnostics_belong_to_their_own_request(tmp_path):
+    """A request running while another is in flight must not lend it its state."""
+    settings = _settings(tmp_path)
+    db = VectorDB(tmp_path / "t.db", dim=4)
+    db.insert_chunks(
+        [Chunk(0, "story", "s1", "姬子", "姬子是星穹列车的领航员", False, "")],
+        [[0.1] * 4],
+    )
+    engine = None
+    state = {"started_b": False, "deep_round": 0}
+
+    def message(content="", tool_calls=None):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))]
+        )
+
+    def tool_call(name, args):
+        return [
+            SimpleNamespace(
+                id="call_1",
+                type="function",
+                function=SimpleNamespace(name=name, arguments=json.dumps(args)),
+            )
+        ]
+
+    class ReentrantLLM:
+        """Runs a whole deep request B in the middle of request A's model call."""
+
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs):
+            if "tools" in kwargs:  # this is B (deep mode)
+                if state["deep_round"] == 0:
+                    state["deep_round"] = 1
+                    return message(tool_calls=tool_call("search_knowledge_base", {"query": "B_PRIVATE_QUERY"}))
+                return message(content="B 的回答帕。")
+            if not state["started_b"]:  # A starts, and B runs to completion inside it
+                state["started_b"] = True
+                list(engine.stream_reply("B_PRIVATE_QUERY", [], mode="deep"))
+            return message(content="A 的回答帕。")
+
+    engine = ChatEngine(settings, db, FakeEmbedder(), llm_client=ReentrantLLM())
+
+    _, diag = engine.reply_with_diagnostics("问题A", [])
+
+    assert diag["question"] == "问题A"
+    assert "B_PRIVATE_QUERY" not in json.dumps(diag.get("steps", []), ensure_ascii=False)
     db.close()
 
 
@@ -135,7 +205,7 @@ def test_retrieve_targets_speaker_when_question_mentions_avatar(tmp_path):
 
     db.search_speaker = counting
     engine = ChatEngine(settings, db, FakeEmbedder())
-    engine._retrieve("姬子是领航员吗？")
+    engine._retrieve("姬子是领航员吗？", {})
     assert any(name == "姬子" for name in calls)
     db.close()
 
@@ -151,7 +221,7 @@ def test_retrieve_excludes_player_joke_lines(tmp_path):
         [[0.2, 0.2, 0.2, 0.2], [0.2, 0.2, 0.2, 0.2]],
     )
     engine = ChatEngine(settings, db, FakeEmbedder())
-    chunks = engine._retrieve("姬子是领航员吗？")
+    chunks = engine._retrieve("姬子是领航员吗？", {})
     assert not any(c.speaker == "Player" for c in chunks)
     assert any(c.speaker == "姬子" for c in chunks)
     db.close()
@@ -169,7 +239,7 @@ def test_retrieve_adds_literal_entity_hits(tmp_path):
     )
     engine = ChatEngine(settings, db, FakeEmbedder())
 
-    chunks = engine._retrieve("差分宇宙里的鲁珀特是什么？")
+    chunks = engine._retrieve("差分宇宙里的鲁珀特是什么？", {})
 
     # top_k=1 的向量检索只会拿到一条，字面实体检索必须把「鲁珀特」那条补回来
     assert any("鲁珀特" in chunk.text for chunk in chunks)
@@ -190,7 +260,7 @@ def test_retrieve_spreads_chunks_across_scenes(tmp_path):
     db.insert_chunks(chunks, [[1.0, 0.0, 0.0, 0.0] for _ in chunks])
     engine = ChatEngine(settings, db, FakeEmbedder())
 
-    result = engine._retrieve("姬子是领航员吗？")
+    result = engine._retrieve("姬子是领航员吗？", {})
 
     same_scene = [chunk for chunk in result if chunk.scene == "same_scene"]
     assert len(result) <= 6
@@ -210,7 +280,7 @@ def test_retrieve_brings_neighbouring_chunks_for_context(tmp_path):
     )
     engine = ChatEngine(settings, db, FakeEmbedder())
 
-    chunks = engine._retrieve("那个家伙是谁？")
+    chunks = engine._retrieve("那个家伙是谁？", {})
 
     # 命中的第一条会把它同场景的邻居一起带出来，供指代消解
     assert any("两截" in chunk.text for chunk in chunks)
@@ -248,7 +318,7 @@ def test_retrieve_harvests_destination_broadcasts_for_travel_questions(tmp_path)
         [[0.5, 0, 0, 0], [0.5, 0, 0, 0], [0.1, 0.1, 0.1, 0.1]],
     )
     engine = ChatEngine(settings, db, FakeEmbedder())
-    chunks = engine._retrieve("星穹列车曾经去过哪些世界？")
+    chunks = engine._retrieve("星穹列车曾经去过哪些世界？", {})
     assert any("目的地" in c.text for c in chunks)
     assert len(chunks) >= 2
     db.close()
@@ -266,7 +336,7 @@ def test_self_intro_retrieval_prefers_pam_lines_and_filters_junk(tmp_path):
         [[0.3, 0.3, 0.3, 0.3], [0.3, 0.3, 0.3, 0.3], [0.3, 0.3, 0.3, 0.3]],
     )
     engine = ChatEngine(settings, db, FakeEmbedder())
-    chunks = engine._retrieve("你好，你是谁？")
+    chunks = engine._retrieve("你好，你是谁？", {})
     speakers = [c.speaker for c in chunks]
     assert "？？？" not in speakers and "未知" not in speakers
     assert "帕姆" in speakers

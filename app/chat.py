@@ -78,28 +78,23 @@ class ChatEngine:
             if settings.api_key
             else None
         )
-        self._deep = DeepThinkEngine(
-            settings,
-            self._llm,
-            kb_search=lambda query, k=5: self._retrieve(query)[:k],
-            web_search=self._web_tool,
-            fetch_page=fetch_page_text if settings.deep_think_fetch_enabled else None,
-            samples_fn=lambda n=5: self.db.pom_pom_samples(n),
-        )
 
     def _web_tool(self, query: str, max_results: int = 5) -> list[dict]:
         return self._web_search_fn(query)
 
-    def _retrieve(self, query: str) -> list[Chunk]:
+    def _retrieve(self, query: str, stats: dict | None = None) -> list[Chunk]:
+        # Defaulting keeps ad-hoc callers (probe scripts) working; a fresh dict is
+        # per call, so nothing is shared between requests either way.
+        stats = stats if stats is not None else {}
         if is_self_intro_question(query):
-            return self._retrieve_self_intro(query)
+            return self._retrieve_self_intro(query, stats)
         context_size = max(self.settings.top_k, MIN_CONTEXT_CHUNKS)
         over_k = max(context_size * OVER_FETCH_MULTIPLIER, context_size)
         query_vector = self.embedder.embed([query])[0]
         # 向量组单独拿：拥挤/冗余主要发生在这里，配额与 MMR 只作用在它上面
         primary = agent_retrieve(
-            self._search,
-            self._reflect_queries,
+            lambda q, k: self._search(q, k, stats),
+            lambda q, texts: self._reflect_queries(q, texts, stats),
             query,
             top_k=over_k,
         )
@@ -108,7 +103,7 @@ class ChatEngine:
         if matched:
             for name in matched:
                 groups.append(self.db.search_speaker(query_vector, name, k=4))
-            self._stats["avatar_routed"] = matched
+            stats["avatar_routed"] = matched
         if is_travel_list_question(query):
             for phrase in TRAVEL_CUE_PHRASES:
                 groups.append(self.db.search(self.embedder.embed([phrase])[0], k=4))
@@ -139,8 +134,8 @@ class ChatEngine:
             if injected >= LITERAL_MAX_GROUPS:
                 break
         if literal_terms:
-            self._stats["literal_terms"] = literal_terms
-            self._stats["literal_injected"] = injected
+            stats["literal_terms"] = literal_terms
+            stats["literal_injected"] = injected
         # Player option/joke lines in message chats are not canon facts.
         def _keep(item: tuple[Chunk, float]) -> bool:
             chunk = item[0]
@@ -206,10 +201,10 @@ class ChatEngine:
                 scene_counts[neighbor.scene] = scene_counts.get(neighbor.scene, 0) + 1
                 added_neighbors += 1
         selected = expanded
-        self._stats["context_neighbors"] = added_neighbors
+        stats["context_neighbors"] = added_neighbors
         scenes = [chunk.scene for chunk, _ in selected]
-        self._stats["context_unique"] = len({chunk.text for chunk, _ in selected})
-        self._stats["context_max_scene"] = (
+        stats["context_unique"] = len({chunk.text for chunk, _ in selected})
+        stats["context_max_scene"] = (
             max(Counter(scenes).values()) if scenes else 0
         )
         return [chunk for chunk, _ in selected]
@@ -235,7 +230,7 @@ class ChatEngine:
                 kept.append((chunk, distance))
         return kept
 
-    def _retrieve_self_intro(self, query: str) -> list[Chunk]:
+    def _retrieve_self_intro(self, query: str, stats: dict) -> list[Chunk]:
         """Identity questions use Pom-Pom's own lines, not generic story scenes."""
         vec = self.embedder.embed([query])[0]
         results = self.db.search_speaker(vec, "帕姆", k=6)
@@ -255,14 +250,16 @@ class ChatEngine:
         )
         return [chunk for chunk, _ in kept]
 
-    def _search(self, query: str, k: int) -> list[tuple[Chunk, float]]:
-        self._stats["searches"] = self._stats.get("searches", 0) + 1
+    def _search(self, query: str, k: int, stats: dict) -> list[tuple[Chunk, float]]:
+        stats["searches"] = stats.get("searches", 0) + 1
         vec = self.embedder.embed([query])[0]
         return self.db.search(vec, k=k)
 
-    def _reflect_queries(self, question: str, context_texts: list[str]) -> list[str]:
+    def _reflect_queries(
+        self, question: str, context_texts: list[str], stats: dict
+    ) -> list[str]:
         """Ask the model what to search next when retrieved context is insufficient."""
-        self._stats["reflect_rounds"] = self._stats.get("reflect_rounds", 0) + 1
+        stats["reflect_rounds"] = stats.get("reflect_rounds", 0) + 1
         if self._llm is None:
             return []
         prompt = (
@@ -294,18 +291,20 @@ class ChatEngine:
             return []
         return []
 
-    def _build_messages(self, user_message: str, history: list[dict]) -> list[dict]:
-        context = self._retrieve(user_message)
+    def _build_messages(
+        self, user_message: str, history: list[dict], stats: dict
+    ) -> list[dict]:
+        context = self._retrieve(user_message, stats)
         samples = self.db.pom_pom_samples(n=5)
         web_results: list[dict] = []
         if self.settings.web_search_enabled and is_build_question(user_message):
             web_results = self._web_search_fn(build_web_query(user_message))
-            self._stats["web_titles"] = [item.get("title", "") for item in web_results]
-            self._stats["web_source"] = (
+            stats["web_titles"] = [item.get("title", "") for item in web_results]
+            stats["web_source"] = (
                 web_results[0].get("source", "") if web_results else ""
             )
         system = build_system_prompt(context, samples, user_message, web_results)
-        self._stats["retrieved"] = [
+        stats["retrieved"] = [
             {
                 "category": chunk.category,
                 "speaker": chunk.speaker,
@@ -315,17 +314,25 @@ class ChatEngine:
         ]
 
         max_history = max(0, self.settings.history_turns)
-        trimmed = history[-max_history:] if max_history else []
+        # 一轮 = 用户 + 帕姆两条消息，按轮数换算成条数再截断
+        trimmed = history[-2 * max_history:] if max_history else []
         messages = [{"role": "system", "content": system}]
         messages.extend(trimmed)
         messages.append({"role": "user", "content": user_message})
         return messages
 
     def stream_reply(
-        self, user_message: str, history: list[dict], mode: str = "normal"
+        self,
+        user_message: str,
+        history: list[dict],
+        mode: str = "normal",
+        *,
+        stats: dict | None = None,
+        on_diagnostics=None,
     ):
         """Yield ``step`` events (deep mode) and exactly one ``reply`` event."""
-        self._stats = {
+        # 每次请求一套状态：并发请求不能互相覆盖（所以不放在 self 上）
+        stats = stats if stats is not None else {
             "searches": 0,
             "reflect_rounds": 0,
             "avatar_routed": [],
@@ -335,21 +342,27 @@ class ChatEngine:
         }
         started = time.time()
         if self._llm is None:
-            self._record_diag(user_message, started, NO_KEY_REPLY, True, mode)
+            self._emit_diag(
+                on_diagnostics,
+                self._record_diag(user_message, started, NO_KEY_REPLY, True, mode, stats),
+            )
             yield self._reply_event(NO_KEY_REPLY, mode, fallback=True)
             return
 
         if mode == "deep":
-            for event in self._deep.run_stream(user_message, history):
+            for event in self._deep_for(stats).run_stream(user_message, history):
                 if event.get("type") != "step":
                     result = event["result"]
-                    self._stats["llm_rounds"] = result.rounds
-                    self._stats["deep_think_tool_calls"] = result.tool_calls
-                    self._stats["insufficient"] = result.insufficient
-                    self._stats["no_answer"] = result.no_answer
-                    self._stats["text_tool_calls"] = result.text_tool_calls
-                    self._record_diag(
-                        user_message, started, result.reply, result.fallback, mode
+                    stats["llm_rounds"] = result.rounds
+                    stats["deep_think_tool_calls"] = result.tool_calls
+                    stats["insufficient"] = result.insufficient
+                    stats["no_answer"] = result.no_answer
+                    stats["text_tool_calls"] = result.text_tool_calls
+                    self._emit_diag(
+                        on_diagnostics,
+                        self._record_diag(
+                            user_message, started, result.reply, result.fallback, mode, stats
+                        ),
                     )
                     yield self._reply_event(
                         result.reply,
@@ -361,11 +374,11 @@ class ChatEngine:
                         no_answer=result.no_answer,
                     )
                     return
-                self._stats["steps"].append(event)
+                stats["steps"].append(event)
                 yield event
             return
 
-        messages = self._build_messages(user_message, history)
+        messages = self._build_messages(user_message, history, stats)
         attempts = 0
         for attempt in range(3):
             attempts += 1
@@ -378,20 +391,31 @@ class ChatEngine:
                 )
                 # Never let tool-call markup or report-style Markdown reach the user.
                 reply = clean_reply(resp.choices[0].message.content or "")
-                self._stats["attempts"] = attempts
+                stats["attempts"] = attempts
                 if not reply:
-                    self._record_diag(user_message, started, FALLBACK_REPLY, True, mode)
+                    self._emit_diag(
+                        on_diagnostics,
+                        self._record_diag(
+                            user_message, started, FALLBACK_REPLY, True, mode, stats
+                        ),
+                    )
                     yield self._reply_event(FALLBACK_REPLY, mode, fallback=True, rounds=1)
                     return
-                self._record_diag(user_message, started, reply, False, mode)
+                self._emit_diag(
+                    on_diagnostics,
+                    self._record_diag(user_message, started, reply, False, mode, stats),
+                )
                 yield self._reply_event(reply, mode, fallback=False, rounds=1)
                 return
             except Exception as exc:  # transient API errors: retry briefly
-                self._stats["last_error"] = f"{type(exc).__name__}: {exc}"
+                stats["last_error"] = f"{type(exc).__name__}: {exc}"
                 if attempt < 2:
                     time.sleep(2)
-        self._stats["attempts"] = attempts
-        self._record_diag(user_message, started, FALLBACK_REPLY, True, mode)
+        stats["attempts"] = attempts
+        self._emit_diag(
+            on_diagnostics,
+            self._record_diag(user_message, started, FALLBACK_REPLY, True, mode, stats),
+        )
         yield self._reply_event(FALLBACK_REPLY, mode, fallback=True, rounds=1)
 
     def _reply_event(
@@ -411,18 +435,44 @@ class ChatEngine:
             "fallback": fallback,
             "insufficient": insufficient,
             "rounds": rounds,
-            "steps": steps if steps is not None else list(self._stats.get("steps", [])),
+            "steps": steps if steps is not None else [],
             "no_answer": no_answer,
         }
 
     def reply(
         self, user_message: str, history: list[dict], mode: str = "normal"
     ) -> str:
+        return self.reply_with_diagnostics(user_message, history, mode=mode)[0]
+
+    def reply_with_diagnostics(
+        self, user_message: str, history: list[dict], mode: str = "normal"
+    ) -> tuple[str, dict]:
+        """Reply plus the diagnostics of *this* request (never a neighbour's)."""
         reply = FALLBACK_REPLY
-        for event in self.stream_reply(user_message, history, mode=mode):
+        diag: dict = {}
+        for event in self.stream_reply(
+            user_message, history, mode=mode, on_diagnostics=diag.update
+        ):
             if event.get("type") == "reply":
                 reply = str(event.get("reply") or FALLBACK_REPLY)
-        return reply
+        return reply, diag
+
+    def _emit_diag(self, on_diagnostics, diag: dict) -> None:
+        """Hand this request's diagnostics to its own caller."""
+        self._last_diag = diag  # 仅供 last_diagnostics() 兼容，响应不再读它
+        if on_diagnostics is not None:
+            on_diagnostics(diag)
+
+    def _deep_for(self, stats: dict) -> DeepThinkEngine:
+        """A deep-think engine bound to this request's stats (no shared state)."""
+        return DeepThinkEngine(
+            self.settings,
+            self._llm,
+            kb_search=lambda query, k=5: self._retrieve(query, stats)[:k],
+            web_search=self._web_tool,
+            fetch_page=fetch_page_text if self.settings.deep_think_fetch_enabled else None,
+            samples_fn=lambda n=5: self.db.pom_pom_samples(n),
+        )
 
     def _record_diag(
         self,
@@ -431,22 +481,25 @@ class ChatEngine:
         reply: str,
         fallback: bool,
         mode: str = "normal",
-    ) -> None:
-        self._last_diag = {
+        stats: dict | None = None,
+    ) -> dict:
+        stats = stats if stats is not None else {}
+        diag = {
             "question": question,
             "model": self.settings.model,
             "elapsed_ms": round((time.time() - started) * 1000),
             "fallback": fallback,
             "reply_len": len(reply),
             "mode": mode,
-            "steps": list(self._stats.get("steps", [])),
-            "llm_rounds": self._stats.get("llm_rounds", 0),
-            "insufficient": self._stats.get("insufficient", False),
-            "no_answer": self._stats.get("no_answer", False),
-            "deep_think_tool_calls": self._stats.get("deep_think_tool_calls", 0),
-            "text_tool_calls": self._stats.get("text_tool_calls", 0),
-            **self._stats,
+            "steps": list(stats.get("steps", [])),
+            "llm_rounds": stats.get("llm_rounds", 0),
+            "insufficient": stats.get("insufficient", False),
+            "no_answer": stats.get("no_answer", False),
+            "deep_think_tool_calls": stats.get("deep_think_tool_calls", 0),
+            "text_tool_calls": stats.get("text_tool_calls", 0),
+            **stats,
         }
+        return diag
 
     def last_diagnostics(self) -> dict:
         return dict(self._last_diag)

@@ -218,22 +218,26 @@ def _extract_rogue_configs(data_dir: Path, text_map: dict) -> Iterator[dict]:
             data = _load_json(path)
         except json.JSONDecodeError:
             continue
-        fields: list[str] = []
-        _walk_hash_fields(data, fields)
-        texts: list[str] = []
-        for field in fields:
-            resolved = clean_text(text_map.get(str(field), ""))
-            if resolved and resolved not in texts:
-                texts.append(resolved)
-        if not texts:
-            continue
-        yield {
-            "category": "rogue",
-            "scene": path.stem,
-            "speaker": "",
-            "text": f"模拟宇宙配置「{path.stem}」：" + "；".join(texts)[:1500],
-            "meta": "",
-        }
+        entries = data if isinstance(data, list) else [data]
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, (dict, list)):
+                continue
+            fields: list[str] = []
+            _walk_hash_fields(entry, fields)
+            texts: list[str] = []
+            for field in fields:
+                resolved = clean_text(text_map.get(str(field), ""))
+                if resolved and resolved not in texts:
+                    texts.append(resolved)
+            if not texts:
+                continue
+            yield {
+                "category": "rogue",
+                "scene": f"{path.stem}.{index}",
+                "speaker": "",
+                "text": f"模拟宇宙配置「{path.stem}」：" + "；".join(texts),
+                "meta": "",
+            }
 
 
 def _collect_hash_texts(node: Any, text_map: dict, out: list[str] | None = None) -> list[str]:

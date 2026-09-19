@@ -14,7 +14,7 @@
 
 | 项目 | 现状 |
 |---|---|
-| 知识库 | 260,577 条记录 → **102,243 个向量片段**（SQLite + sqlite-vec，231 MB） |
+| 知识库 | 271,061 条记录 → **109,446 个向量片段**（SQLite + sqlite-vec，248 MB） |
 | 对话覆盖率 | 游戏内 `TalkSentenceConfig` 共 240,488 条对话，本地能引用到 **125,518 条（52.2%）** |
 | 自动化测试 | **168 passed**（`pytest`，结果自动存档到 `test-results/`） |
 | 统一评测集 | `eval/testset.json` 65 题 / 10 个轴：快档 **28/30**、普通档 **28/29**、深度档 **6/6**（另有 3 条已知缺口记录在案） |
@@ -51,7 +51,7 @@ avatar/dialogue/mission/item/monster 模块保持一致，数据源同为 `Dimbr
 |---|---|---|---:|---:|
 | `story` | 主线／支线剧情 | 任务演出对白（`Story/Mission`、`Story/Discussion`、`Config/Level/Mission/**/Act*.json`） | 182,544 | 58,598 |
 | `messages` | 短信 | 游戏内短信（`MessageContactsConfig`/`MessageItemConfig` 等） | 13,255 | 7,222 |
-| `rogue` | 模拟宇宙 | 模拟宇宙对白（`Config/Level/Rogue**`）＋ 祝福／命途配置（`ExcelOutput/Rogue*.json`） | 12,925 | 2,407 |
+| `rogue` | 模拟宇宙 | 模拟宇宙对白（`Config/Level/Rogue**`）＋ 祝福／命途配置（`ExcelOutput/Rogue*.json`，逐条提取） | 23,409 | 9,610 |
 | `books` | 书籍 | 书籍文本（`BookSeriesConfig` ＋ `LocalbookConfig` 两套书库） | 12,100 | 12,097 |
 | `avatars` | 角色信息 | 角色档案、技能、语音线、角色故事（`AvatarConfig`/`AvatarSkillConfig`/`VoiceAtlas`/`StoryAtlas`） | 11,923 | 2,857 |
 | `missions` | 任务 | 主线／支线任务条目（`MainMission`/`SubMission`） | 10,218 | 7,017 |
@@ -173,6 +173,16 @@ powershell -ExecutionPolicy Bypass -File scripts/start_server.ps1 -BindHost 0.0.
 > 注意：部分免费档模型（如智谱 GLM-4.7-Flash）响应延迟明显，单次对话可能需要数十秒，
 > 页面会显示「帕姆正在翻列车智库……」，请耐心等待；超时（120 秒）会走帕姆口吻兜底。
 
+**公网部署请务必带上访问口令**，否则拿到链接的任何人都能消耗你的模型额度：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_server.ps1 -Public -Token 你自己设的口令
+```
+
+启动后把 `https://xxx.trycloudflare.com/#token=你的口令` 发给访客——前端会记住口令，
+之后直接访问也会自动带上。终端里不带 `#token` 的链接打不开聊天（会提示需要通行证）。
+每来源 IP 默认限速 20 次/分钟，`POM_RATE_LIMIT_PER_MINUTE=0` 可关闭。
+
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -190,6 +200,11 @@ powershell -ExecutionPolicy Bypass -File scripts/start_server.ps1 -BindHost 0.0.
 | `BOCHA_API_KEY` | （空） | 博查搜索 API Key；配置后搜索链优先用它（`https://open.bochaai.com`） |
 | `WEB_SEARCH_SOURCES` | `bocha,duckduckgo,so360,sogou` | 搜索源顺序（按序尝试，第一个有结果的就用） |
 | `DEBUG` | `false` | 调试模式：控制台打印每次请求诊断，并开放 `/api/debug/*` |
+| `POM_ACCESS_TOKEN` | （空） | 设置后聊天接口必须带令牌（`Authorization: Bearer …` 或 `X-Access-Token`）；留空 = 不校验，本地使用不变 |
+| `POM_RATE_LIMIT_PER_MINUTE` | `20` | 每个来源 IP 每分钟的请求上限，`0` = 不限制 |
+| `POM_MAX_HISTORY_MESSAGES` | `40` | 一次请求最多接受多少条历史消息 |
+| `POM_MAX_HISTORY_CHARS` | `20000` | 历史消息总字数上限 |
+| `POM_MAX_MESSAGE_CHARS` | `2000` | 单条提问字数上限 |
 | `DEEP_THINK_MAX_STEPS` | `6` | 深度思考最多 LLM 轮数 |
 | `DEEP_THINK_TIMEOUT_SECONDS` | `180` | 深度思考总时限（秒） |
 | `DEEP_THINK_LLM_TIMEOUT_SECONDS` | `60` | 深度思考单轮 LLM 超时（秒） |
@@ -216,7 +231,7 @@ $env:DEBUG="true"; .venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0
 |---|---|---|
 | `POST` | `/api/chat` | 普通问答，返回 `reply` / `mode` / `steps` |
 | `POST` | `/api/chat/stream` | SSE 流式：`step`（思考步骤）→ `reply` → `done` |
-| `GET` | `/api/health` | 健康检查（库片段数、模型是否已配置） |
+| `GET` | `/api/health` | 健康检查：`status`（`ok` / `degraded`）、片段数、embedder 是否已加载、模型是否已配置 |
 | `GET` | `/api/debug/info` | 运行时配置与知识库状态（仅 DEBUG） |
 | `GET` | `/api/debug/logs` | 最近 100 次请求诊断（仅 DEBUG） |
 
@@ -310,8 +325,12 @@ powershell -ExecutionPolicy Bypass -File scripts/run_tests.ps1
 ```bash
 Remove-Item -Recurse -Force data/StarRailData
 powershell -ExecutionPolicy Bypass -File scripts/fetch_data.ps1
-# 重新执行「快速开始」第 4 步的两条导入命令
+# 提取 + 重新入库（导入约 30-40 分钟，中途中断不会破坏旧库）
+.venv\Scripts\python.exe scripts/rebuild_knowledge_base.py
 ```
+
+只想重跑其中一步时：`--skip-extract` 跳过提取（语料没变、只改切块或入库逻辑时用）。
+重建期间建议先 `scripts/start_server.ps1 -Stop`，避免服务正读着旧库。
 
 补充 sparse checkout 之外的文件（Mission／Rogue／全量 ExcelOutput）：
 

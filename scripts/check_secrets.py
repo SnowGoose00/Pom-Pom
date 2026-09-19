@@ -72,34 +72,58 @@ def scan_text(text: str, *, label: str) -> list[str]:
     return findings
 
 
-def git(*args: str) -> str:
-    return subprocess.run(
+class GitError(RuntimeError):
+    """Git failed -- an empty listing is not the same as a clean tree."""
+
+
+def git(*args: str, root: Path | None = None, required: bool = True) -> str:
+    result = subprocess.run(
         ["git", *args],
-        cwd=ROOT,
+        cwd=root or ROOT,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         check=False,
-    ).stdout
+    )
+    if required and result.returncode != 0:
+        raise GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout
 
 
-def tracked_files() -> list[str]:
-    return [line for line in git("ls-files").splitlines() if line.strip()]
+def tracked_files(root: Path | None = None) -> list[str]:
+    """NUL-separated, so non-ASCII paths are not escaped into unusable strings."""
+    return [name for name in git("ls-files", "-z", root=root).split("\0") if name]
 
 
-def scan_tracked_files() -> list[str]:
-    """Audit what a ``git push`` would actually send."""
+def index_text(name: str, root: Path | None = None) -> str | None:
+    """The exact content git would commit for ``name`` (not the worktree copy)."""
+    result = subprocess.run(
+        ["git", "show", f":{name}"],
+        cwd=root or ROOT,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def scan_tracked_files(root: Path | None = None) -> list[str]:
+    """Audit what a ``git commit`` would actually send.
+
+    The index is the source of truth: a key that was staged and then edited out
+    of the worktree still gets committed, so scanning the worktree is not enough.
+    """
     findings: list[str] = []
-    for name in tracked_files():
-        path = ROOT / name
-        if not path.is_file() or path.suffix.lower() in SKIP_SUFFIXES:
+    for name in tracked_files(root):
+        if Path(name).suffix.lower() in SKIP_SUFFIXES:
             continue
-        if path.stat().st_size > MAX_FILE_BYTES:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+        text = index_text(name, root)
+        if text is None or "\x00" in text or len(text) > MAX_FILE_BYTES:
             continue
         findings += scan_text(text, label=name)
     return findings
@@ -135,10 +159,19 @@ def main() -> int:
     parser.add_argument("--history", action="store_true", help="also scan every commit")
     args = parser.parse_args()
 
-    print(f"tracked files: {len(tracked_files())}")
+    try:
+        staged = tracked_files()
+    except GitError as exc:
+        print(f"cannot list tracked files: {exc}")
+        return 2
+    print(f"tracked files: {len(staged)}")
     findings = scan_tracked_files()
     if args.history:
-        history_findings = scan_history()
+        try:
+            history_findings = scan_history()
+        except GitError as exc:
+            print(f"cannot read history: {exc}")
+            return 2
         print(f"history findings: {len(history_findings)}")
         findings += history_findings
 

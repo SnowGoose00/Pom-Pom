@@ -1,4 +1,4 @@
-import app.websearch as app_websearch
+﻿import app.websearch as app_websearch
 from app.websearch import (
     build_web_query,
     fetch_page_text,
@@ -89,6 +89,57 @@ def test_html_to_text_strips_scripts_and_tags():
     assert "<" not in text
 
 
+class _StreamBody:
+    """Adapts the simple fakes below to the streaming response API."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    @property
+    def status_code(self):
+        return getattr(self._inner, "status_code", 200)
+
+    @property
+    def headers(self):
+        return getattr(self._inner, "headers", {}) or {}
+
+    @property
+    def encoding(self):
+        return "utf-8"
+
+    def raise_for_status(self):
+        return self._inner.raise_for_status()
+
+    def iter_bytes(self):
+        if hasattr(self._inner, "iter_bytes"):
+            yield from self._inner.iter_bytes()
+        else:
+            yield self._inner.text.encode("utf-8")
+
+
+class _StreamContext:
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __enter__(self):
+        return _StreamBody(self._inner)
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _patch_stream(monkeypatch, responder):
+    """Make app.websearch fetch through a fake, keeping the streaming API."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fetch_page_text 必须用 httpx.stream 限流读取")
+
+    monkeypatch.setattr("app.websearch.httpx.get", forbidden)
+    monkeypatch.setattr(
+        "app.websearch.httpx.stream",
+        lambda method, url, **kwargs: _StreamContext(responder(url, **kwargs)),
+    )
+
+
 def test_fetch_page_text_truncates_and_rejects_local_urls(monkeypatch):
     class Resp:
         text = "<html><body><p>" + "长" * 500 + "</p></body></html>"
@@ -96,19 +147,112 @@ def test_fetch_page_text_truncates_and_rejects_local_urls(monkeypatch):
         def raise_for_status(self):
             return None
 
-    monkeypatch.setattr("app.websearch.httpx.get", lambda *a, **k: Resp())
+    _patch_stream(monkeypatch, lambda *a, **k: Resp())
+    monkeypatch.setattr(
+        "app.websearch._resolve_public",
+        lambda host: "93.184.216.34" if host.endswith("example.com") else None,
+    )
     assert len(fetch_page_text("https://example.com/a", max_chars=50)) == 50
     assert fetch_page_text("http://127.0.0.1:8000/") == ""
     assert fetch_page_text("http://localhost/admin") == ""
     assert fetch_page_text("file:///c:/secret.txt") == ""
 
 
+def test_fetch_page_text_refuses_every_kind_of_internal_address(monkeypatch):
+    """Hostnames that *look* public but resolve inward must be rejected."""
+
+    class Resp:
+        text = "<html><body><p>内网内容</p></body></html>"
+
+        def raise_for_status(self):
+            return None
+
+    _patch_stream(monkeypatch, lambda *a, **k: Resp())
+    for url in (
+        "http://2130706433/",  # loopback written as a decimal integer
+        "http://0x7f000001/",  # loopback written in hex
+        "http://[::1]/",  # IPv6 loopback
+        "http://192.0.2.10/",  # 文档保留段（同样不是公网地址）
+        "http://203.0.113.7/",  # 文档保留段
+        "http://169.254.169.254/latest/meta-data/",  # cloud metadata
+        "http://0.0.0.0/",
+    ):
+        assert fetch_page_text(url) == "", url
+
+
+def test_fetch_page_text_refuses_a_redirect_into_the_local_network(monkeypatch):
+    calls = []
+
+    class Redirect:
+        status_code = 302
+        headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return Redirect()
+
+    _patch_stream(monkeypatch, fake_get)
+    monkeypatch.setattr(
+        "app.websearch._resolve_public",
+        lambda host: "93.184.216.34" if host == "example.com" else None,
+    )
+
+    assert fetch_page_text("https://example.com/x") == ""
+    assert calls == ["https://example.com/x"], "不能真的去请求私网地址"
+
+
 def test_fetch_page_text_returns_empty_on_error(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("network down")
 
-    monkeypatch.setattr("app.websearch.httpx.get", boom)
+    _patch_stream(monkeypatch, boom)
     assert fetch_page_text("https://example.com/x") == ""
+
+
+def test_fetch_page_text_stops_reading_a_huge_body(monkeypatch):
+    """The byte cap must stop the download, not just truncate the string."""
+    consumed = {"chunks": 0}
+
+    class Huge:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            for _ in range(10_000):
+                consumed["chunks"] += 1
+                yield b"x" * 4096
+
+    _patch_stream(monkeypatch, lambda *a, **k: Huge())
+    monkeypatch.setattr("app.websearch._resolve_public", lambda host: "93.184.216.34")
+
+    text = fetch_page_text("https://example.com/huge", max_chars=20)
+
+    assert text == "x" * 20, "内容应当来自假响应"
+    assert consumed["chunks"] < 200, f"应当提前停止读取，实际读了 {consumed['chunks']} 块"
+
+
+def test_fetch_page_text_refuses_a_binary_body(monkeypatch):
+    class Binary:
+        status_code = 200
+        headers = {"content-type": "application/pdf"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield b"%PDF-1.4 not text"
+
+    _patch_stream(monkeypatch, lambda *a, **k: Binary())
+    monkeypatch.setattr("app.websearch._resolve_public", lambda host: "93.184.216.34")
+
+    assert fetch_page_text("https://example.com/a.pdf") == ""
 
 
 def test_fetch_page_text_follows_js_redirect_from_search_engines(monkeypatch):
@@ -134,7 +278,8 @@ def test_fetch_page_text_follows_js_redirect_from_search_engines(monkeypatch):
         calls.append(url)
         return RedirectPage() if "sogou.com/link" in url else RealPage()
 
-    monkeypatch.setattr("app.websearch.httpx.get", fake_get)
+    _patch_stream(monkeypatch, fake_get)
+    monkeypatch.setattr("app.websearch._resolve_public", lambda host: "93.184.216.34")
     text = fetch_page_text("https://www.sogou.com/link?url=abc")
 
     assert "真正的攻略正文" in text

@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from app.extract import clean_text, extract_all
@@ -132,9 +133,46 @@ def test_extract_rogue_configs_as_searchable_text(tmp_path):
     extract_all(FIXTURES, tmp_path)
     rogue = [r for r in _records(tmp_path) if r["category"] == "rogue"]
 
-    config = next(r for r in rogue if r["scene"] == "RogueBuff")
+    config = next(r for r in rogue if r["scene"].startswith("RogueBuff"))
     assert "祝福" in config["text"]
     assert config["speaker"] == ""
+
+
+def _fixture_copy_with_long_rogue(tmp_path: Path) -> Path:
+    """Copy the fixtures and add a Rogue config whose texts overflow the old 1500-char cut."""
+    data_dir = tmp_path / "data"
+    shutil.copytree(FIXTURES, data_dir)
+    excel = data_dir / "ExcelOutput"
+    text_map_path = data_dir / "TextMap" / "TextMapCHS.json"
+    text_map = json.loads(text_map_path.read_text(encoding="utf-8"))
+    entries = []
+    for index in range(10):
+        key = str(900 + index)
+        text_map[key] = f"祝福{index}：" + "描述内容" * 50
+        entries.append(
+            {
+                "RogueBuffID": index + 1,
+                "BuffName": {"Hash": int(key)},
+                "BuffDesc": {"Hash": int(key)},
+            }
+        )
+    (excel / "RogueLongBuff.json").write_text(
+        json.dumps(entries, ensure_ascii=False), encoding="utf-8"
+    )
+    text_map_path.write_text(json.dumps(text_map, ensure_ascii=False), encoding="utf-8")
+    return data_dir
+
+
+def test_rogue_config_entries_survive_the_whole_file(tmp_path):
+    """Long configs used to be concatenated and cut at 1500 chars, dropping entries."""
+    data_dir = _fixture_copy_with_long_rogue(tmp_path)
+
+    extract_all(data_dir, tmp_path / "out")
+    rogue = [r for r in _records(tmp_path / "out") if r["category"] == "rogue"]
+    kept = "\n".join(r["text"] for r in rogue if r["scene"].startswith("RogueLongBuff"))
+
+    assert "祝福0" in kept
+    assert "祝福9" in kept, "文件末尾的条目不能在提取阶段被截断丢掉"
 
 
 def test_extract_handles_rogue_simple_talk_and_ignores_option_text(tmp_path):

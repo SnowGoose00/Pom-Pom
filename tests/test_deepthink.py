@@ -357,6 +357,60 @@ def test_expired_budget_skips_loop_and_still_answers(tmp_path):
     assert "tools" not in llm.calls[0]
 
 
+class _Clock:
+    """Virtual clock so budget behaviour is deterministic."""
+
+    def __init__(self, start: float = 0.0):
+        self.value = start
+
+    def __call__(self) -> float:
+        return self.value
+
+    def tick(self, seconds: float) -> None:
+        self.value += seconds
+
+
+def test_budget_stops_further_tools_inside_one_round(tmp_path):
+    """A round may ask for several tools; once the budget is gone the rest must not run."""
+    settings = _settings(tmp_path, deep_think_timeout_seconds=10.0)
+    llm = ScriptedLLM(
+        [
+            {
+                "tool_calls": [
+                    ("search_knowledge_base", {"query": "姬子"}),
+                    ("search_web", {"query": "姬子 攻略"}),
+                    ("fetch_page", {"url": "https://example.com"}),
+                ]
+            },
+            {"content": "先说说帕姆知道的部分。"},
+        ]
+    )
+    clock = _Clock()
+    kb_calls, web_calls, fetched = [], [], []
+
+    def kb(query, k=5):
+        clock.tick(20)  # this single tool burns the whole budget
+        kb_calls.append(query)
+        return [_chunk("姬子是星穹列车的领航员")]
+
+    def web(query, max_results=5):
+        web_calls.append(query)
+        return []
+
+    def fetch(url, max_chars=4000):
+        fetched.append(url)
+        return ""
+
+    engine = _engine(settings, llm, kb=kb, web=web, fetch=fetch, now=clock)
+    result = engine.run("姬子是谁？", [])
+
+    assert kb_calls == ["姬子"]
+    assert web_calls == [] and fetched == [], "预算用完后不能再开新工具"
+    assert len(result.steps) == 3, "每个工具调用都要有观察结果，否则模型会收到残缺的调用序列"
+    assert "预算" in result.steps[1]["observation"]
+    assert result.reply == "先说说帕姆知道的部分。"
+
+
 def test_tool_failure_becomes_an_observation_instead_of_crashing(tmp_path):
     settings = _settings(tmp_path)
     llm = ScriptedLLM(

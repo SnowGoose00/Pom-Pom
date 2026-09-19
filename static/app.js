@@ -9,11 +9,35 @@ const clearBtn = document.getElementById("clear");
 const STORE_KEY = "pom-pom-chat-v1";
 const WELCOME =
   "欢迎登上星穹列车，开拓者！帕姆是列车长帕姆，有什么想聊的尽管说哦！";
-const MAX_HISTORY = 40; // 20 turns (user + assistant)
-const MAX_MESSAGES = 40; // what we keep in the browser across reloads
+const { createConversation, statusText, resolveToken, MAX_MESSAGES } = window.PomPomCore;
 
-let history = [];
-let transcript = []; // [{ role: "user" | "pom", text }]
+// All conversation state lives in chat-core.js so it can be unit tested.
+const conv = createConversation(loadTranscript());
+let inFlight = null; // AbortController of the request currently on screen
+
+const TOKEN_KEY = "pom-pom-token-v1";
+
+function readStoredToken() {
+  try {
+    return localStorage.getItem(TOKEN_KEY) || "";
+  } catch (err) {
+    return "";
+  }
+}
+
+// 通行证来自分享链接（#token=…），记下来下次直接可用
+const accessToken = resolveToken(window.location.hash, readStoredToken());
+if (accessToken) {
+  try {
+    localStorage.setItem(TOKEN_KEY, accessToken);
+  } catch (err) {
+    /* private mode: keep it only for this page */
+  }
+}
+
+function authHeaders() {
+  return accessToken ? { "X-Access-Token": accessToken } : {};
+}
 
 const DEEP_ICONS = {
   search_knowledge_base: "🔍",
@@ -49,27 +73,14 @@ function loadTranscript() {
 
 function persistTranscript() {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(transcript));
+    localStorage.setItem(STORE_KEY, JSON.stringify(conv.transcript));
   } catch (err) {
     /* quota or privacy mode: chatting still works, it just won't survive reload */
   }
 }
 
-function syncHistory() {
-  history = transcript
-    .map((item) => ({
-      role: item.role === "user" ? "user" : "assistant",
-      content: item.text,
-    }))
-    .slice(-MAX_HISTORY);
-}
-
 function recordMessage(role, text) {
-  transcript.push({ role, text });
-  if (transcript.length > MAX_MESSAGES) {
-    transcript = transcript.slice(-MAX_MESSAGES);
-  }
-  syncHistory();
+  conv.add(role, text);
   persistTranscript();
 }
 
@@ -94,11 +105,16 @@ function addMessage(role, text) {
 }
 
 function clearConversation() {
-  if (transcript.length > 1 && !window.confirm("要清空和帕姆的全部对话吗？")) {
+  if (conv.transcript.length > 1 && !window.confirm("要清空和帕姆的全部对话吗？")) {
     return;
   }
-  transcript = [];
-  history = [];
+  // Cancel the in-flight request and mark it stale: a late reply must not land
+  // in the freshly cleared conversation.
+  if (inFlight) {
+    inFlight.abort();
+    inFlight = null;
+  }
+  conv.clear();
   try {
     localStorage.removeItem(STORE_KEY);
   } catch (err) {
@@ -110,12 +126,10 @@ function clearConversation() {
 }
 
 function restoreConversation() {
-  transcript = loadTranscript();
-  if (!transcript.length) {
+  if (!conv.transcript.length) {
     return false;
   }
-  transcript.forEach((item) => renderMessage(item.role, item.text));
-  syncHistory();
+  conv.transcript.forEach((item) => renderMessage(item.role, item.text));
   return true;
 }
 
@@ -134,14 +148,17 @@ function setTyping(on) {
   sendBtn.disabled = on;
 }
 
-async function sendNormal(message) {
+async function sendNormal(message, token, signal) {
   const resp = await fetch("/api/chat", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history: history.slice(-MAX_HISTORY) })
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ message, history: conv.outgoing(message) }),
+    signal
   });
+  if (resp.status === 401) throw new Error("unauthorized");
   if (!resp.ok) throw new Error("bad status " + resp.status);
   const data = await resp.json();
+  if (conv.isStale(token)) return data.reply; // cleared while we waited
   addMessage("pom", data.reply);
   return data.reply;
 }
@@ -179,17 +196,19 @@ function addThinkStep(panel, step) {
   chat.scrollTop = chat.scrollHeight;
 }
 
-async function sendDeep(message) {
+async function sendDeep(message, token, signal) {
   const panel = addThinkingPanel();
   const resp = await fetch("/api/chat/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({
       message,
-      history: history.slice(-MAX_HISTORY),
+      history: conv.outgoing(message),
       mode: "deep",
-    })
+    }),
+    signal
   });
+  if (resp.status === 401) throw new Error("unauthorized");
   if (!resp.ok || !resp.body) throw new Error("bad status " + resp.status);
 
   const reader = resp.body.getReader();
@@ -225,6 +244,9 @@ async function sendDeep(message) {
     ? `帕姆的思考过程（查了 ${steps} 次）`
     : "帕姆的思考过程";
   panel.open = false;
+  if (conv.isStale(token)) {
+    return reply; // conversation was cleared; drop this answer
+  }
   addMessage("pom", reply || "呜……列车广播好像出故障了，开拓者稍等一下再试试哦！");
   return reply;
 }
@@ -237,13 +259,24 @@ async function send() {
   addMessage("user", message);
   if (!deep) setTyping(true);
   sendBtn.disabled = true;
+  const token = conv.generation;
+  const controller = new AbortController();
+  inFlight = controller;
   try {
     // sendDeep/sendNormal already append the reply via addMessage, which keeps
     // the in-browser transcript (and the history sent to the backend) in sync.
-    await (deep ? sendDeep(message) : sendNormal(message));
+    await (deep ? sendDeep(message, token, controller.signal) : sendNormal(message, token, controller.signal));
   } catch (err) {
-    addMessage("pom", "呜……列车广播好像出故障了，开拓者稍等一下再试试哦！");
+    if (!controller.signal.aborted && !conv.isStale(token)) {
+      addMessage(
+        "pom",
+        err && err.message === "unauthorized"
+          ? "这趟列车需要通行证帕。请用带 #token=… 的链接打开，或者找帕姆要一张。"
+          : "呜……列车广播好像出故障了，开拓者稍等一下再试试哦！"
+      );
+    }
   } finally {
+    if (inFlight === controller) inFlight = null;
     if (!deep) setTyping(false);
     sendBtn.disabled = false;
   }
@@ -256,10 +289,9 @@ async function init() {
   try {
     const resp = await fetch("/api/health");
     const data = await resp.json();
-    statusEl.textContent = data.db_ready
-      ? `列车智库在线 · ${data.db_chunks} 条记录` + (data.model_configured ? "" : " · 未配置通行证")
-      : "智库尚未就绪，请运行数据导入";
-    statusEl.classList.toggle("ok", data.db_ready && data.model_configured);
+    const status = statusText(data);
+    statusEl.textContent = status.text;
+    statusEl.classList.toggle("ok", status.ok);
   } catch (e) {
     statusEl.textContent = "无法连接后端服务";
   }

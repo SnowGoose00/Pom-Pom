@@ -93,6 +93,10 @@ def chunk_records(
         group.append(rec)
     if group:
         final.extend(_chunk_group(group, len(final), max_lines, max_chars))
+    # Ids are assigned *before* dedupe so a dropped duplicate can still point at
+    # the neighbours it had in its own scene (see _dedupe_chunks).
+    for index, chunk in enumerate(final):
+        chunk.id = index
     return _dedupe_chunks(final)
 
 
@@ -120,8 +124,9 @@ def _dedupe_records(records: list[dict]) -> list[dict]:
 def _dedupe_chunks(chunks: list[Chunk]) -> list[Chunk]:
     """Collapse identical chunk texts (same monster/mission in many config ids).
 
-    The first occurrence is kept; the other scenes are recorded in ``meta`` so no
-    information about where the entry appears is lost.
+    The first occurrence is kept; the other scenes are recorded in ``meta``
+    (``aliases`` plus the matching ``alias_ids``) so that neighbourhood lookup
+    can still reach the lines surrounding those dropped occurrences.
     """
     kept: list[Chunk] = []
     position_by_key: dict[tuple[str, str], int] = {}
@@ -129,7 +134,6 @@ def _dedupe_chunks(chunks: list[Chunk]) -> list[Chunk]:
         key = (chunk.category, chunk.text)
         position = position_by_key.get(key)
         if position is None:
-            chunk.id = len(kept)
             position_by_key[key] = len(kept)
             kept.append(chunk)
             continue
@@ -137,10 +141,13 @@ def _dedupe_chunks(chunks: list[Chunk]) -> list[Chunk]:
         meta = json.loads(target.meta or "{}")
         meta["alias_count"] = int(meta.get("alias_count", 1)) + 1
         aliases = meta.setdefault("aliases", [])
+        alias_ids = meta.setdefault("alias_ids", [])
         if chunk.scene != target.scene and chunk.scene not in aliases:
             aliases.append(chunk.scene)
+            alias_ids.append(chunk.id)
             if len(aliases) > _MAX_ALIASES:
                 aliases.pop()
+                alias_ids.pop()
         target.meta = json.dumps(meta, ensure_ascii=False)
     return kept
 
@@ -164,8 +171,7 @@ def import_from_dialogues(
 
     db = VectorDB(db_path, dim=dim)
     try:
-        db.clear()
-        db.insert_chunks(chunks, embeddings)
+        db.replace_all(chunks, embeddings)
         return len(chunks)
     finally:
         db.close()
